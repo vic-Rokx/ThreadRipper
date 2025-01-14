@@ -8,6 +8,7 @@ const assert = std.debug.assert;
 const ThreadRipper = @This();
 arena: *std.mem.Allocator,
 sync: Atomic(u32) = Atomic(u32).init(@bitCast(Sync{})),
+workingCount: Atomic(u32) = Atomic(u32).init(0),
 stack_size: u32,
 max_threads: u32,
 global_queue: ContractQueue = .{},
@@ -37,7 +38,7 @@ pub const JobList = struct {
 const JobProto = *const fn (*Job) anyerror!void;
 
 pub const Node = struct {
-    id: u16 = 0,
+    id: u32 = 0,
     data: Job,
     next: ?*Node = null,
 };
@@ -68,14 +69,43 @@ pub const Sync = packed struct {
 
 pub fn init(target: *ThreadRipper, options: Options) !void {
     const thread_count = options.max_threads orelse 1;
+
     target.* = .{
         .stack_size = @max(1, options.stack_size),
         .max_threads = thread_count,
         .arena = options.arena,
     };
 
+    // _ = target.workingCount.cmpxchgStrong(0, thread_count, .acquire, .monotonic);
+
     if (builtin.single_threaded) {
         return;
+    }
+
+    // kill and join any threads we spawned and free memory on error.
+    // target.threads = try target.arena.alloc(std.Thread, thread_count);
+    var spawned: u14 = 0;
+    // errdefer target.join(spawned);
+
+    var sync: Sync = @bitCast(target.sync.load(.monotonic));
+    var new_sync = sync;
+
+    for (0..thread_count) |_| {
+        const spawn_config = std.Thread.SpawnConfig{ .stack_size = target.stack_size };
+        const spawned_thread = std.Thread.spawn(spawn_config, Thread.worker, .{target}) catch return target.unregister(null);
+        spawned_thread.detach();
+        spawned += 1;
+    }
+
+    new_sync.spawned_threads = spawned;
+    while (true) {
+        new_sync.spawned_threads = spawned;
+        sync = @bitCast(target.sync.cmpxchgStrong(
+            @bitCast(sync),
+            @bitCast(new_sync),
+            .acquire,
+            .monotonic,
+        ) orelse break);
     }
 }
 
@@ -87,95 +117,6 @@ pub fn deinit(thread_ripper: *ThreadRipper) void {
 pub fn generateJob(thread_ripper: *ThreadRipper, comptime func: anytype, args: anytype) !*Node {
     const job_node = try thread_ripper.createNode(func, args);
     return job_node;
-}
-
-var counter: Atomic(u32) = Atomic(u32).init(0);
-fn testThreadFunc() !void {
-    // std.time.sleep(1_000_000_000);
-    const current_counter = counter.load(.monotonic);
-    _ = counter.cmpxchgStrong(current_counter, current_counter + 1, .acquire, .monotonic);
-}
-
-fn generateLongList(thread_ripper: *ThreadRipper) !JobList {
-    var job_list = JobList{
-        .head = undefined,
-        .tail = undefined,
-    };
-
-    var node = try thread_ripper.createNode(testThreadFunc, .{});
-    node.id = 200;
-    const tail: *Node = node;
-    var head: *Node = undefined;
-    for (0..100) |i| {
-        head = try thread_ripper.createNode(testThreadFunc, .{});
-        head.id = @intCast(i);
-        head.next = node;
-        node = head;
-    }
-    job_list.head = head;
-    job_list.tail = tail;
-
-    return job_list;
-}
-
-test "Init ThreadRipper" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var arena = gpa.allocator();
-    var thread_ripper: ThreadRipper = undefined;
-    const options = Options{
-        .max_threads = 6,
-        .arena = &arena,
-    };
-
-    try thread_ripper.init(options);
-    // var long_list = try generateLongList(&thread_ripper);
-
-    // const node1 = try thread_ripper.createNode(testThreadFunc, .{});
-    // node1.id = 1;
-    // const node2 = try thread_ripper.createNode(testThreadFunc2, .{});
-    // node2.id = 2;
-    // node1.next = node2;
-    //
-    // var job_list = JobList{
-    //     .head = node1,
-    //     .tail = node2,
-    // };
-    // try thread_ripper.dispatchJob(node1);
-    // thread_ripper.dispatchBatch(&job_list);
-
-    // Try to notify a thread
-    print("Disptach batch \n", .{});
-    // std.time.sleep(3_000_000_000);
-    const node = try thread_ripper.generateJob(testThreadFunc, .{});
-    try thread_ripper.dispatchJob(node);
-
-    // thread_ripper.notify(is_waking);
-    while (true) {
-        std.time.sleep(3_000_000_000);
-        print("\n\nRunning next jobs\n", .{});
-        // const node1 = try thread_ripper.createNode(testThreadFunc, .{});
-        // node1.id = 1;
-        // const node2 = try thread_ripper.createNode(testThreadFunc2, .{});
-        // node2.id = 2;
-        // node1.next = node2;
-        //
-        // var job_list = JobList{
-        //     .head = node1,
-        //     .tail = node2,
-        // };
-        // const node3 = try thread_ripper.createNode(testThreadFunc, .{});
-        // node3.id = 3;
-        // print("Created node \n", .{});
-        // const node4 = try thread_ripper.createNode(testThreadFunc2, .{});
-        // node4.id = 4;
-        // node3.next = node4;
-        //
-        // var job_list2 = JobList{
-        //     .head = node3,
-        //     .tail = node4,
-        // };
-        // try thread_ripper.dispatchJob(node1);
-    }
 }
 
 fn register(noalias thread_ripper: *ThreadRipper, noalias thread: *Thread) void {
@@ -265,28 +206,28 @@ pub fn dispatchBatch(thread_ripper: *ThreadRipper, job_list: *JobList) void {
     thread_ripper.notify(is_waking);
 }
 
-pub fn done(thread_ripper: *ThreadRipper) bool {
-    const sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
-    if (sync.state == .shutdown) {
-        return false;
-    } else {
-        print("\n{d} {d}", .{ sync.idle_threads, sync.spawned_threads });
+pub fn working(thread_ripper: *ThreadRipper) bool {
+    const workingCount = thread_ripper.workingCount.load(.acquire);
+    if (workingCount > 0) {
         return true;
+    } else {
+        std.time.sleep(5_000_000);
+        return false;
     }
 }
 
-// fn join(thread_ripper: *ThreadRipper) void {
-//     // Wait for the thread pool to be shutdown() then for all threads to enter a joinable state
-//     thread_ripper.join_event.wait();
-//     const sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
-//     assert(sync.state == .shutdown);
-//     assert(sync.spawned == 0);
-//
-//     // If there are threads, start off the chain sending it the shutdown signal.
-//     // The thread receives the shutdown signal and sends it to the next thread, and the next..
-//     const thread = thread_ripper.threads.load(.Acquire) orelse return;
-//     thread.join_event.notify();
-// }
+fn join(thread_ripper: *ThreadRipper) void {
+    // Wait for the thread pool to be shutdown() then for all threads to enter a joinable state
+    thread_ripper.join_event.wait();
+    const sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
+    assert(sync.state == .shutdown);
+    assert(sync.spawned == 0);
+
+    // If there are threads, start off the chain sending it the shutdown signal.
+    // The thread receives the shutdown signal and sends it to the next thread, and the next..
+    const thread = thread_ripper.threads.load(.Acquire) orelse return;
+    thread.join_event.notify();
+}
 
 // This function checks per worker thread if it is notified or is idle
 noinline fn wait(thread_ripper: *ThreadRipper, _is_waking: bool) error{Shutdown}!bool {
@@ -460,11 +401,26 @@ const Thread = struct {
             while (thread.pop(thread_ripper)) |stolen_node| {
                 if (stolen_node.pushed or is_waking) {
                     thread_ripper.notify(is_waking);
+                    // var workingCount = thread_ripper.workingCount.load(.monotonic);
+                    // while (true) {
+                    //     if (workingCount < thread_ripper.max_threads) {
+                    //         print("\nIncrementing worker count: {d}\n", .{workingCount});
+                    //         workingCount = thread_ripper.workingCount.cmpxchgStrong(workingCount, workingCount + 1, .acquire, .monotonic) orelse break;
+                    //     }
+                    // }
                 }
                 const run_node = stolen_node.node;
                 const runFn = run_node.data.runFn;
                 is_waking = false;
                 try runFn(&run_node.data);
+            } else {
+                // var workingCount = thread_ripper.workingCount.load(.monotonic);
+                // while (true) {
+                //     if (workingCount > 0) {
+                //         print("\nDecrementing worker count: {d}\n", .{workingCount});
+                //         workingCount = thread_ripper.workingCount.cmpxchgStrong(workingCount, workingCount - 1, .acquire, .monotonic) orelse break;
+                //     }
+                // }
             }
         }
     }
@@ -725,7 +681,7 @@ const JobQueue = struct {
         // We then loop and try and grab the head of the buffer and exchange it for head+%1
         // If we can't do this we return the buffer node
         while (true) {
-            // Quick sanity check and return null when not empty
+            // Quick sanity check and return null when queue is empty
             const size = tail -% head;
             assert(size <= capacity);
             if (size == 0) {
