@@ -1,68 +1,106 @@
 const std = @import("std");
 const ThreadRipper = @import("ThreadRipper.zig");
+const GK = ThreadRipper.GateKeeper;
 const print = std.debug.print;
 const Atomic = std.atomic.Value;
 var counter: Atomic(u32) = Atomic(u32).init(0);
 const WaitGroup = std.Thread.WaitGroup;
 
 var start: i128 = 0;
+var count: usize = 0;
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer if (gpa.deinit() != .ok) @panic("Memmory leak...");
-    var allocator = gpa.allocator();
-    var thread_ripper: ThreadRipper = undefined;
-    const options = ThreadRipper.Options{
-        .max_threads = @intCast(std.Thread.getCpuCount() catch 6),
-        .arena = &allocator,
-    };
-    try thread_ripper.init(options);
+    const allocator = gpa.allocator();
+    // var thread_ripper: ThreadRipper = undefined;
+    // const options = ThreadRipper.Options{
+    //     .max_threads = @intCast(std.Thread.getCpuCount() catch 6),
+    //     .arena = &allocator,
+    // };
+    // try thread_ripper.init(options);
+    // thread_ripper.warm();
+    // var gk: GK = undefined;
+    // try gk.init(thread_ripper.arena);
+    // gk.action_list.* = try generateLotsOfJobs(&thread_ripper);
+    // defer gk.deinit();
+    // const ids = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    // for (0..10) |i| {
+    //     try thread_ripper.fork(&gk, testThreadFuncATOMIC, .{i + 1});
+    // }
+    // start = std.time.milliTimestamp(); // Use the standard system clock
+    // try testThreadFuncATOMIC(0);
+    // try thread_ripper.waitAndWork(&gk);
+
     // defer thread_ripper.deinit();
 
     // print("Disptach batch \n", .{});
-    try testTwoJobs(&thread_ripper);
-    while (true) {}
+    // while (true) {}
     // while (thread_ripper.working()) {}
+
+    start = std.time.milliTimestamp(); // Use the standard system clock
 
     // var pool: std.Thread.Pool = undefined;
     // try std.Thread.Pool.init(&pool, .{ .n_jobs = @intCast(std.Thread.getCpuCount() catch 6), .allocator = allocator });
     // defer pool.deinit();
-    //
+    // //
     // var wait_group: WaitGroup = undefined;
     // wait_group.reset();
-    // start = std.time.nanoTimestamp(); // Use the standard system clock
-    // for (0..std.Thread.getCpuCount() catch 6) |_| {
-    //     try pool.spawn(testThreadFunc, .{&wait_group});
+    // // try testTwoJobs(&thread_ripper, &wait_group);
+    // // while (true) {}
+    var queues: []*std.ArrayList(?usize) = try allocator.alloc(*std.ArrayList(?usize), 10);
+    for (0..std.Thread.getCpuCount() catch 6) |i| {
+        var queue = std.ArrayList(?usize).init(allocator);
+        queues[i] = &queue;
+        // var thread = try std.Thread.spawn(.{}, testThreadFuncMutex, .{queue});
+        // thread.detach();
+    }
+
+    var counter_: usize = 0;
+    while (counter_ < 1000000 / 10) : (counter_ += 1) {
+        try queues[counter_ % 10].append(1);
+        counter_ += 1;
+    }
+
+    // while (count < 99999999) : (counter_ += 1) {
+    //     var node = std.SinglyLinkedList(usize).Node{
+    //         .data = 1,
+    //     };
+    //     queues[counter_ % 10].prepend(&node);
     // }
     //
+    for (queues) |q| {
+        var thread = try std.Thread.spawn(.{}, testThreadFuncMutex, .{q});
+        thread.detach();
+    }
+
     // pool.waitAndWork(&wait_group);
+    while (true) {}
 }
 
-var count: usize = 0;
+fn testThreadFuncMutex(queue: *std.ArrayList(?usize)) void {
+    // wait_group.start();
+    // defer wait_group.finish();
 
-fn testThreadFunc(wait_group: *WaitGroup) void {
-    wait_group.start();
-    defer wait_group.finish();
-
-    while (true) {
-        if (count >= 999999) {
-            const end = std.time.nanoTimestamp();
+    while (queue.pop()) |inc| {
+        if (count >= 1000000) {
+            const end = std.time.milliTimestamp();
             const duration = end - start;
-            std.debug.print("Function ran for {d} nanoseconds\n", .{duration});
+            std.debug.print("Function ran for {any} miliseconds\n", .{duration});
             break;
         }
-        count += 1;
+        count += inc;
+        print("{any}\n", .{count});
         // Remove the 'orelse break' so the thread keeps trying if it fails
     }
 }
 
-fn testThreadFuncATOMIC(_: *ThreadRipper) !void {
-    // if (!thread_ripper.working()) return;
-    // std.time.sleep(1_000_000_000);
+fn testThreadFuncATOMIC(id: usize) !void {
     while (true) {
-        if (count >= 999999) {
-            const end = std.time.nanoTimestamp();
+        if (count == 99999999) {
+            const end = std.time.milliTimestamp();
             const duration = end - start;
-            std.debug.print("Function ran for {d} nanoseconds\n", .{duration});
+            std.debug.print("Function ran for {any} miliseconds\n", .{duration});
+            print("Id: {any}, count: {any}\n", .{ id, count });
             break;
         }
         count += 1;
@@ -74,25 +112,25 @@ fn testThreadFuncATOMIC(_: *ThreadRipper) !void {
 fn increment() !void {
     count += 1;
     if (count >= 999999) {
-        const end = std.time.nanoTimestamp();
+        const end = std.time.milliTimestamp();
         const duration = end - start;
-        std.debug.print("Function ran for {d} nanoseconds\n", .{duration});
+        std.debug.print("Function ran for {d} nanoseconds\n", .{duration / 9});
     }
 }
 
-fn generateLotsOfJobs(thread_ripper: *ThreadRipper) !ThreadRipper.JobList {
-    var job_list = ThreadRipper.JobList{
+fn generateLotsOfJobs(thread_ripper: *ThreadRipper) !ThreadRipper.ActionList {
+    var job_list = ThreadRipper.ActionList{
         .head = undefined,
         .tail = undefined,
     };
 
-    var node = try thread_ripper.generateJob(increment, .{});
+    var node = try thread_ripper.generateJob(testThreadFuncATOMIC, .{0});
     node.id = 1000000;
-    // node.id = @intCast(std.Thread.getCpuCount() catch 6);
+    node.id = @intCast(std.Thread.getCpuCount() catch 6);
     const tail: *ThreadRipper.Node = node;
     var head: *ThreadRipper.Node = undefined;
-    for (0..1000000) |i| {
-        head = try thread_ripper.generateJob(increment, .{});
+    for (0..100) |i| {
+        head = try thread_ripper.generateJob(testThreadFuncATOMIC, .{0});
         head.id = @intCast(i);
         head.next = node;
         node = head;
@@ -103,18 +141,20 @@ fn generateLotsOfJobs(thread_ripper: *ThreadRipper) !ThreadRipper.JobList {
     return job_list;
 }
 
-fn incrementBatch(start_size: usize, end_size: usize) !void {
+fn incrementBatch(start_size: usize, end_size: usize, wait_group: *WaitGroup) !void {
+    wait_group.start();
+    defer wait_group.finish();
     for (start_size..end_size) |_| {
         const count_v = counter.fetchAdd(1, .seq_cst);
         if (count_v == 999999) {
-            const end = std.time.nanoTimestamp();
+            const end = std.time.milliTimestamp();
             const duration = end - start;
-            std.debug.print("Function ran for {d} nanoseconds\n", .{duration});
+            std.debug.print("Function ran for {any} miliseconds\n", .{duration});
         }
     }
 }
 
-fn generateBatchedJobs(thread_ripper: *ThreadRipper) !ThreadRipper.JobList {
+fn generateBatchedJobs(thread_ripper: *ThreadRipper, wait_group: *WaitGroup) !ThreadRipper.JobList {
     var job_list = ThreadRipper.JobList{
         .head = undefined,
         .tail = undefined,
@@ -126,7 +166,7 @@ fn generateBatchedJobs(thread_ripper: *ThreadRipper) !ThreadRipper.JobList {
 
     var node = try thread_ripper.generateJob(
         incrementBatch,
-        .{ job_count * batch_size, (job_count + 1) * batch_size },
+        .{ job_count * batch_size, (job_count + 1) * batch_size, wait_group },
     );
 
     node.id = 1000000;
@@ -137,7 +177,7 @@ fn generateBatchedJobs(thread_ripper: *ThreadRipper) !ThreadRipper.JobList {
     for (0..job_count) |i| {
         head = try thread_ripper.generateJob(
             incrementBatch,
-            .{ i * batch_size, (i + 1) * batch_size },
+            .{ i * batch_size, (i + 1) * batch_size, wait_group },
         );
         head.id = @intCast(i);
         head.next = node;
@@ -151,8 +191,8 @@ fn generateBatchedJobs(thread_ripper: *ThreadRipper) !ThreadRipper.JobList {
 }
 
 fn testTwoJobs(thread_ripper: *ThreadRipper) !void {
-    var job_list = try generateBatchedJobs(thread_ripper);
-    start = std.time.nanoTimestamp(); // Use the standard system clock
+    var job_list = try generateLotsOfJobs(thread_ripper);
     print("Running jobs\n", .{});
+    start = std.time.milliTimestamp(); // Use the standard system clock
     thread_ripper.dispatchBatch(&job_list);
 }

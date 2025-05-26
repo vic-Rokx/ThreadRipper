@@ -11,7 +11,7 @@ sync: Atomic(u32) = Atomic(u32).init(@bitCast(Sync{})),
 workingCount: Atomic(u32) = Atomic(u32).init(0),
 stack_size: u32,
 max_threads: u32,
-global_queue: ContractQueue = .{},
+global_queue: Injector = .{},
 threads_stack: Atomic(?*Thread) = Atomic(?*Thread).init(null),
 idle_event: Event = .{},
 join_event: Event = .{},
@@ -26,20 +26,20 @@ pub const Options = struct {
     max_threads: ?u32 = null,
 };
 
-const Job = struct {
-    runFn: JobProto,
+const Action = struct {
+    runFn: ActionProto,
 };
 
-pub const JobList = struct {
+pub const ActionList = struct {
     head: *Node,
     tail: *Node,
 };
 
-const JobProto = *const fn (*Job) anyerror!void;
+const ActionProto = *const fn (*Action) anyerror!void;
 
 pub const Node = struct {
     id: u32 = 0,
-    data: Job,
+    data: Action,
     next: ?*Node = null,
 };
 
@@ -76,56 +76,76 @@ pub fn init(target: *ThreadRipper, options: Options) !void {
         .arena = options.arena,
     };
 
-    // _ = target.workingCount.cmpxchgStrong(0, thread_count, .acquire, .monotonic);
-
     if (builtin.single_threaded) {
         return;
     }
+}
 
-    // kill and join any threads we spawned and free memory on error.
-    // target.threads = try target.arena.alloc(std.Thread, thread_count);
-    var spawned: u14 = 0;
-    // errdefer target.join(spawned);
+pub fn deinit(tr: *ThreadRipper) void {
+    tr.join(tr.threads.len); // kill and join all threads.
+    tr.* = undefined;
+}
 
-    var sync: Sync = @bitCast(target.sync.load(.monotonic));
+pub fn warm(tr: *ThreadRipper) void {
+    var sync = @as(Sync, @bitCast(tr.sync.load(.monotonic)));
     var new_sync = sync;
 
-    for (0..thread_count) |_| {
-        const spawn_config = std.Thread.SpawnConfig{ .stack_size = target.stack_size };
-        const spawned_thread = std.Thread.spawn(spawn_config, Thread.worker, .{target}) catch return target.unregister(null);
-        spawned_thread.detach();
-        spawned += 1;
+    var thread_count: u14 = 0;
+    for (tr.max_threads) |_| {
+        thread_count += 1;
+        const spawn_config = std.Thread.SpawnConfig{ .stack_size = tr.stack_size };
+        const thread = std.Thread.spawn(spawn_config, Thread.worker, .{tr}) catch return tr.unregister(null);
+        thread.detach();
     }
 
-    new_sync.spawned_threads = spawned;
+    new_sync.spawned_threads = thread_count;
+
     while (true) {
-        new_sync.spawned_threads = spawned;
-        sync = @bitCast(target.sync.cmpxchgStrong(
-            @bitCast(sync),
-            @bitCast(new_sync),
-            .acquire,
+        sync = @as(Sync, @bitCast(tr.sync.cmpxchgWeak(
+            @as(u32, @bitCast(sync)),
+            @as(u32, @bitCast(new_sync)),
+            .release,
             .monotonic,
-        ) orelse break);
+        ) orelse break));
     }
 }
 
-pub fn deinit(thread_ripper: *ThreadRipper) void {
-    thread_ripper.join(thread_ripper.threads.len); // kill and join all threads.
-    thread_ripper.* = undefined;
-}
-
-pub fn generateJob(thread_ripper: *ThreadRipper, comptime func: anytype, args: anytype) !*Node {
-    const job_node = try thread_ripper.createNode(func, args);
+pub fn generateJob(tr: *ThreadRipper, comptime func: anytype, args: anytype) !*Node {
+    const job_node = try tr.createNode(func, args);
     return job_node;
 }
 
-fn register(noalias thread_ripper: *ThreadRipper, noalias thread: *Thread) void {
+/// Marks the thread pool as shutdown
+pub noinline fn shutdown(tr: *ThreadRipper) void {
+    var sync = @as(Sync, @bitCast(tr.sync.load(.monotonic)));
+    while (sync.state != .shutdown) {
+        var new_sync = sync;
+        new_sync.notified = true;
+        new_sync.state = .shutdown;
+        new_sync.idle_threads = 0;
+
+        // Full barrier to synchronize with both wait() and notify()
+        sync = @as(Sync, @bitCast(tr.sync.cmpxchgWeak(
+            @as(u32, @bitCast(sync)),
+            @as(u32, @bitCast(new_sync)),
+            .acq_rel,
+            .monotonic,
+        ) orelse {
+            // Wake up any threads sleeping on the idle_event.
+            // TODO: I/O polling notification here.
+            if (sync.idle_threads > 0) tr.idle_event.shutdown();
+            return;
+        }));
+    }
+}
+
+fn register(noalias tr: *ThreadRipper, noalias thread: *Thread) void {
     // Push the thread onto the threads stack in a lock-free manner.
-    var threads_stack = thread_ripper.threads_stack.load(.monotonic);
+    var threads_stack = tr.threads_stack.load(.monotonic);
     // Threads is a stack we add the thread to the front of the stack
     while (true) {
         thread.next = threads_stack;
-        threads_stack = thread_ripper.threads_stack.cmpxchgStrong(
+        threads_stack = tr.threads_stack.cmpxchgStrong(
             threads_stack,
             thread,
             .release,
@@ -133,30 +153,164 @@ fn register(noalias thread_ripper: *ThreadRipper, noalias thread: *Thread) void 
         ) orelse break;
     }
 }
-fn unregister(noalias thread_ripper: *ThreadRipper, noalias _: ?*Thread) void {
+fn unregister(noalias tr: *ThreadRipper, noalias maybe_thread: ?*Thread) void {
     // Un-spawn one thread, either due to a failed OS thread spawning or the thread is exitting.
     const one_spawned: u32 = @bitCast(Sync{ .spawned_threads = 1 });
-    const sync: Sync = @bitCast(thread_ripper.sync.fetchSub(one_spawned, .release));
+    const sync: Sync = @bitCast(tr.sync.fetchSub(one_spawned, .release));
     assert(sync.spawned_threads > 0);
 
     // The last thread to exit must wake up the thread pool join()er
     // who will start the chain to shutdown all the threads.
-    // if (sync.state == .shutdown and sync.spawned_threads == 1) {
-    //     thread_ripper.join_event.notify();
-    // }
-    //
-    // // If this is a thread pool thread, wait for a shutdown signal by the thread pool join()er.
-    // const thread = maybe_thread orelse return;
-    // thread.join_event.wait();
-    //
-    // // After receiving the shutdown signal, shutdown the next thread in the pool.
-    // // We have to do that without touching the thread pool itself since it's memory is invalidated by now.
-    // // So just follow our .next link.
-    // const next_thread = thread.next orelse return;
-    // next_thread.join_event.notify();
+    if (sync.state == .shutdown and sync.spawned_threads == 1) {
+        tr.join_event.notify();
+    }
+
+    // If this is a thread pool thread, wait for a shutdown signal by the thread pool join()er.
+    const thread = maybe_thread orelse return;
+    thread.join_event.wait();
+
+    // After receiving the shutdown signal, shutdown the next thread in the pool.
+    // We have to do that without touching the thread pool itself since it's memory is invalidated by now.
+    // So just follow our .next link.
+    const next_thread = thread.next orelse return;
+    next_thread.join_event.notify();
 }
 
-fn createNode(thread_ripper: *ThreadRipper, comptime func: anytype, args: anytype) !*Node {
+// Release is for when we change something and want the rest to see
+// While Aquire is for when we want to make sure we see everything beforehand
+pub const GateKeeper = struct {
+    const GK = @This();
+    arena: *std.mem.Allocator,
+    count: Atomic(u32) = Atomic(u32).init(0),
+    event: std.Thread.ResetEvent = .{},
+    action_list: *ActionList,
+
+    pub fn init(target: *GK, arena: *std.mem.Allocator) !void {
+        const action_list = try arena.create(ActionList);
+        action_list.* = ActionList{
+            .head = undefined,
+            .tail = undefined,
+        };
+        target.* = .{
+            .arena = arena,
+            .action_list = action_list,
+        };
+    }
+
+    pub fn deinit(gk: *GK) void {
+        gk.arena.destroy(gk.action_list);
+        gk.event.reset();
+        gk.* = undefined;
+    }
+
+    pub fn incr(gk: *GK) u32 {
+        return gk.count.fetchAdd(1, .release);
+    }
+
+    pub fn decr(gk: *GK) void {
+        _ = gk.count.fetchSub(1, .acquire);
+        if (gk.count.load(.monotonic) == 0) {
+            gk.event.set();
+        }
+    }
+
+    pub fn isDone(gk: *GK) bool {
+        return gk.count.load(.monotonic) == 0;
+    }
+
+    pub fn wait(gk: *GK) void {
+        while (true) {
+            if (gk.isDone()) {
+                return;
+            }
+
+            gk.event.wait();
+        }
+    }
+
+    pub fn reset(gk: *GK) void {
+        gk.event.reset();
+    }
+};
+
+/// Fork is the call function to start a function call
+/// This is used in conjunction withGateKeeper
+pub fn fork(
+    tr: *ThreadRipper,
+    gk: *GateKeeper,
+    comptime func: anytype,
+    args: anytype,
+) !void {
+    if (builtin.single_threaded) {
+        try @call(.auto, func, args);
+        return;
+    }
+
+    const Args = @TypeOf(args);
+
+    const Runnable = struct {
+        args: Args,
+        tr: *ThreadRipper,
+        gk: *GateKeeper,
+        run_node: Node = .{ .data = .{ .runFn = runFn } },
+
+        fn runFn(action: *Action) !void {
+            const run_node: *Node = @fieldParentPtr("data", action);
+            const runnable: *@This() = @alignCast(@fieldParentPtr("run_node", run_node));
+            try @call(.auto, func, runnable.args);
+
+            runnable.gk.decr();
+            runnable.tr.arena.destroy(runnable);
+        }
+    };
+
+    const runnable = try tr.arena.create(Runnable);
+    runnable.* = .{
+        .args = args,
+        .tr = tr,
+        .gk = gk,
+    };
+    if (gk.count.load(.monotonic) == 0) {
+        gk.action_list.tail = &runnable.run_node;
+    }
+    runnable.run_node.id = gk.incr();
+
+    runnable.run_node.next = gk.action_list.head;
+    gk.action_list.head = &runnable.run_node;
+}
+
+pub fn waitAndWork(tr: *ThreadRipper, gk: *GateKeeper) !void {
+    try tr.distributeBatch(gk.action_list);
+    gk.wait();
+}
+
+pub fn distributeBatch(tr: *ThreadRipper, action_list: *ActionList) !void {
+    const threads_stack = tr.threads_stack.load(.monotonic);
+    var thread = threads_stack;
+
+    var node = action_list.head;
+    var counter: usize = 0;
+    while (counter < 10) {
+        if (thread) |t| {
+            var single_list = ActionList{
+                .head = node,
+                .tail = node,
+            };
+            try t.action_queue.enqueue(&single_list);
+            // print("{any}\n", .{t.action_queue.buffer[0].load(.monotonic)});
+            thread = t.next;
+        }
+        node = node.next orelse break;
+        counter += 1;
+    }
+    // tr.global_queue.push(&action_list);
+
+    // Notify waiting threads outside the lock to try and keep the critical section small.
+    const is_waking = false;
+    tr.notify(is_waking);
+}
+
+fn createNode(tr: *ThreadRipper, comptime func: anytype, args: anytype) !*Node {
     if (builtin.single_threaded) {
         try @call(.auto, func, args);
         return;
@@ -165,78 +319,75 @@ fn createNode(thread_ripper: *ThreadRipper, comptime func: anytype, args: anytyp
     const Args = @TypeOf(args);
     const Closure = struct {
         arguments: Args,
-        thread_ripper: *ThreadRipper,
+        tr: *ThreadRipper,
         run_node: Node = .{ .data = .{ .runFn = runFn } },
 
-        fn runFn(job: *Job) !void {
-            const run_node: *Node = @fieldParentPtr("data", job);
+        fn runFn(action: *Action) !void {
+            const run_node: *Node = @fieldParentPtr("data", action);
             const closure: *@This() = @alignCast(@fieldParentPtr("run_node", run_node));
             try @call(.auto, func, closure.arguments);
-            closure.thread_ripper.arena.destroy(closure);
+
+            // In a lock-free context, we need to ensure memory ordering
+            // Use atomic fence before destruction to ensure all writes are visible
+            // @fence(.acquire);
+
+            closure.tr.arena.destroy(closure);
+            // @fence(.release);
         }
     };
 
-    const closure = try thread_ripper.arena.create(Closure);
+    const closure = try tr.arena.create(Closure);
     closure.* = .{
         .arguments = args,
-        .thread_ripper = thread_ripper,
+        .tr = tr,
     };
+    // @fence(.release);
     return &closure.run_node;
 }
 
-pub fn dispatchJob(thread_ripper: *ThreadRipper, node: *Node) !void {
-    // const sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
-    // print("\nthread idle count {d}\n\n", .{sync.idle_threads});
-    // const node = try thread_ripper.generateJob(testThreadFunc, .{});
-    var job_list = JobList{
+pub fn dispatchJob(tr: *ThreadRipper, node: *Node) !void {
+    var action_list = ActionList{
         .head = node,
         .tail = node,
     };
 
-    thread_ripper.global_queue.push(&job_list);
+    tr.global_queue.push(&action_list);
 
     // Notify waiting threads outside the lock to try and keep the critical section small.
     const is_waking = false;
-    thread_ripper.notify(is_waking);
+    tr.notify(is_waking);
 }
 
-pub fn dispatchBatch(thread_ripper: *ThreadRipper, job_list: *JobList) void {
-    thread_ripper.global_queue.push(job_list);
+pub fn dispatchBatch(tr: *ThreadRipper, action_list: *ActionList) void {
+    tr.global_queue.push(action_list);
     const is_waking = false;
-    thread_ripper.notify(is_waking);
+    tr.notify(is_waking);
 }
 
-pub fn working(thread_ripper: *ThreadRipper) bool {
-    const workingCount = thread_ripper.workingCount.load(.acquire);
-    if (workingCount > 0) {
-        return true;
-    } else {
-        std.time.sleep(5_000_000);
-        return false;
-    }
-}
-
-fn join(thread_ripper: *ThreadRipper) void {
+fn join(tr: *ThreadRipper) void {
     // Wait for the thread pool to be shutdown() then for all threads to enter a joinable state
-    thread_ripper.join_event.wait();
-    const sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
+    var sync = @as(Sync, @bitCast(tr.sync.load(.monotonic)));
+    if (!(sync.state == .shutdown and sync.spawned == 0)) {
+        tr.join_event.wait();
+        sync = @as(Sync, @bitCast(tr.sync.load(.monotonic)));
+    }
+
     assert(sync.state == .shutdown);
     assert(sync.spawned == 0);
 
     // If there are threads, start off the chain sending it the shutdown signal.
     // The thread receives the shutdown signal and sends it to the next thread, and the next..
-    const thread = thread_ripper.threads.load(.Acquire) orelse return;
+    const thread = tr.threads.load(.acquire) orelse return;
     thread.join_event.notify();
 }
-
 // This function checks per worker thread if it is notified or is idle
-noinline fn wait(thread_ripper: *ThreadRipper, _is_waking: bool) error{Shutdown}!bool {
+noinline fn wait(tr: *ThreadRipper, _is_waking: bool) error{Shutdown}!bool {
     var is_idle = false;
     var is_waking = _is_waking;
-    var sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
+    var sync: Sync = @bitCast(tr.sync.load(.monotonic));
 
     while (true) {
-        // we check the thread_ripper sync flag to check if we are in shutdown mode
+        // we check the tr sync flag to check if we are in shutdown mode
         if (sync.state == .shutdown) return error.Shutdown;
         // if is_waking is true then we assert that the state is also waking
         if (is_waking) assert(sync.state == .waking);
@@ -259,7 +410,7 @@ noinline fn wait(thread_ripper: *ThreadRipper, _is_waking: bool) error{Shutdown}
             // to ensure that pushes to run queue are observed after wait() returns.
             // We update the new sync state if we succeed then we have reset the state and return is_waking
             // which if it is false we return a bool if the sync.state is .signaled
-            sync = @bitCast(thread_ripper.sync.cmpxchgStrong(
+            sync = @bitCast(tr.sync.cmpxchgStrong(
                 @bitCast(sync),
                 @bitCast(new_sync),
                 .acquire,
@@ -279,7 +430,7 @@ noinline fn wait(thread_ripper: *ThreadRipper, _is_waking: bool) error{Shutdown}
                 new_sync.state = .pending;
 
             // if we succed we set is_waking to false and is_idle to true so now we update the loop
-            sync = @bitCast(thread_ripper.sync.cmpxchgStrong(
+            sync = @bitCast(tr.sync.cmpxchgStrong(
                 @bitCast(sync),
                 @bitCast(new_sync),
                 .monotonic,
@@ -295,32 +446,32 @@ noinline fn wait(thread_ripper: *ThreadRipper, _is_waking: bool) error{Shutdown}
             // TODO: Add I/O polling here.
         } else {
             // if we are not notified and idle_threads = true
-            thread_ripper.idle_event.wait();
-            sync = @bitCast(thread_ripper.sync.load(.monotonic));
+            tr.idle_event.wait();
+            sync = @bitCast(tr.sync.load(.monotonic));
         }
     }
 }
 
-inline fn notify(thread_ripper: *ThreadRipper, is_waking: bool) void {
+inline fn notify(tr: *ThreadRipper, is_waking: bool) void {
     // Fast path to check the Sync state to avoid calling into notifySlow().
     // If we're waking, then we need to update the state regardless
     // false then no thread is waking up atm
     if (!is_waking) {
         // we load the sync and check if notified
         // if notified then we return since we do not notify twice
-        const sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
+        const sync: Sync = @bitCast(tr.sync.load(.monotonic));
         if (sync.notified) {
             return;
         }
     }
 
     // else we run notifySlow which essentially checks the threads and wakes them up appropriatley
-    return thread_ripper.notifySlow(is_waking);
+    return tr.notifySlow(is_waking);
 }
 
-noinline fn notifySlow(thread_ripper: *ThreadRipper, is_waking: bool) void {
+noinline fn notifySlow(tr: *ThreadRipper, is_waking: bool) void {
     // We load the new Sync state
-    var sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
+    var sync: Sync = @bitCast(tr.sync.load(.monotonic));
     while (sync.state != .shutdown) {
         // we check if we can wake up a thread if is_waking or the state is pending
         const can_wake = is_waking or (sync.state == .pending);
@@ -335,7 +486,7 @@ noinline fn notifySlow(thread_ripper: *ThreadRipper, is_waking: bool) void {
         if (can_wake and sync.idle_threads > 0) { // wake up an idle_threads thread
             // print("Idle threads: {d}\n", .{sync.idle_threads});
             new_sync.state = .signaled;
-        } else if (can_wake and sync.spawned_threads < thread_ripper.max_threads) { // spawn a new thread
+        } else if (can_wake and sync.spawned_threads < tr.max_threads) { // spawn a new thread
             // print("icrementing thread spawn count\n", .{});
             // we check if can_wake and the spawned threads is less than the max
             // threads can be waiting
@@ -351,7 +502,7 @@ noinline fn notifySlow(thread_ripper: *ThreadRipper, is_waking: bool) void {
 
         // release barrier synchronizes with Acquire in wait()
         // to ensure pushes to run queues happen before observing a posted notification.
-        sync = @bitCast(thread_ripper.sync.cmpxchgStrong(
+        sync = @bitCast(tr.sync.cmpxchgStrong(
             @bitCast(sync),
             @bitCast(new_sync),
             .release,
@@ -361,14 +512,13 @@ noinline fn notifySlow(thread_ripper: *ThreadRipper, is_waking: bool) void {
             // We signaled to notify an idle_threads thread
             if (can_wake and sync.idle_threads > 0) {
                 // print("CAS succeeded\n", .{});
-                return thread_ripper.idle_event.notify();
+                return tr.idle_event.notify();
             }
 
             // We signaled to spawn a new thread
-            if (can_wake and sync.spawned_threads < thread_ripper.max_threads) {
-                print("Spawning another thread\n", .{});
-                const spawn_config = std.Thread.SpawnConfig{ .stack_size = thread_ripper.stack_size };
-                const thread = std.Thread.spawn(spawn_config, Thread.worker, .{thread_ripper}) catch return thread_ripper.unregister(null);
+            if (can_wake and sync.spawned_threads < tr.max_threads) {
+                const spawn_config = std.Thread.SpawnConfig{ .stack_size = tr.stack_size };
+                const thread = std.Thread.spawn(spawn_config, Thread.worker, .{tr}) catch return tr.unregister(null);
                 return thread.detach();
             }
 
@@ -381,86 +531,71 @@ const Thread = struct {
     next: ?*Thread = null,
     target: ?*Thread = null,
     join_event: Event = .{},
-    job_queue: JobQueue = .{},
-    contract_queue: ContractQueue = .{},
+    action_queue: ActionQueue = .{},
+    injector: Injector = .{},
 
     threadlocal var current: ?*Thread = null;
 
-    fn worker(thread_ripper: *ThreadRipper) !void {
+    fn worker(tr: *ThreadRipper) !void {
         var thread = Thread{};
         current = &thread;
 
         // add the thread to the threads linkedlist
-        thread_ripper.register(&thread);
-        defer thread_ripper.unregister(&thread);
+        tr.register(&thread);
+        defer tr.unregister(&thread);
 
         // set is_waking
         var is_waking = false;
         while (true) {
-            is_waking = thread_ripper.wait(is_waking) catch return;
-            while (thread.pop(thread_ripper)) |stolen_node| {
+            is_waking = tr.wait(is_waking) catch return;
+            while (thread.pop(tr)) |stolen_node| {
                 if (stolen_node.pushed or is_waking) {
-                    thread_ripper.notify(is_waking);
-                    // var workingCount = thread_ripper.workingCount.load(.monotonic);
-                    // while (true) {
-                    //     if (workingCount < thread_ripper.max_threads) {
-                    //         print("\nIncrementing worker count: {d}\n", .{workingCount});
-                    //         workingCount = thread_ripper.workingCount.cmpxchgStrong(workingCount, workingCount + 1, .acquire, .monotonic) orelse break;
-                    //     }
-                    // }
+                    tr.notify(is_waking);
                 }
                 const run_node = stolen_node.node;
                 const runFn = run_node.data.runFn;
                 is_waking = false;
                 try runFn(&run_node.data);
-            } else {
-                // var workingCount = thread_ripper.workingCount.load(.monotonic);
-                // while (true) {
-                //     if (workingCount > 0) {
-                //         print("\nDecrementing worker count: {d}\n", .{workingCount});
-                //         workingCount = thread_ripper.workingCount.cmpxchgStrong(workingCount, workingCount - 1, .acquire, .monotonic) orelse break;
-                //     }
-                // }
-            }
+            } else {}
         }
     }
 
-    /// Try to dequeue a Node/Job from the ThreadRipper.
+    /// Try to dequeue a Node/Action from the ThreadRipper.
     /// Spurious reports of dequeue() returning empty are allowed.
-    fn pop(noalias thread: *Thread, noalias thread_ripper: *ThreadRipper) ?JobQueue.Stole {
+    fn pop(noalias thread: *Thread, noalias tr: *ThreadRipper) ?ActionQueue.Thief {
         // Check our local buffer first
-        if (thread.job_queue.dequeue()) |node| {
-            return JobQueue.Stole{
+        if (thread.action_queue.dequeue()) |node| {
+            return ActionQueue.Thief{
                 .node = node,
                 .pushed = false,
             };
         }
 
         // Then check our local queue
-        if (thread.job_queue.consume(&thread.contract_queue)) |stole| {
+        if (thread.action_queue.consume(&thread.injector)) |stole| {
             return stole;
         }
 
-        // Then the global queue
-        if (thread.job_queue.consume(&thread_ripper.global_queue)) |stole| {
-            return stole;
-        }
+        // // Then the global queue
+        // if (thread.action_queue.consume(&tr.global_queue)) |stole| {
+        //     return stole;
+        // }
 
         // TODO: add optimistic I/O polling here
 
         // Then try work stealing from other threads
         // print("Nothing to consume\n", .{});
-        const sync: Sync = @bitCast(thread_ripper.sync.load(.monotonic));
+        const sync: Sync = @bitCast(tr.sync.load(.monotonic));
         var num_threads: u32 = sync.spawned_threads;
         // print("number of threads {d}\n", .{num_threads});
         while (num_threads > 0) : (num_threads -= 1) {
             // Traverse the stack of registered threads on the thread pool
-            const target = thread.target orelse thread_ripper.threads_stack.load(.acquire) orelse unreachable;
+            const target = thread.target orelse tr.threads_stack.load(.acquire) orelse unreachable;
             // if (target == null) return null;
             thread.target = target.next;
 
             // Try to steal from their queue first to avoid contention (the target steal's from queue last).
-            if (thread.job_queue.consume(&target.contract_queue)) |stole| {
+            if (thread.action_queue.consume(&target.injector)) |stole| {
                 return stole;
             }
 
@@ -471,7 +606,7 @@ const Thread = struct {
             }
 
             // Steal from the buffer of a remote thread as a last resort
-            if (thread.job_queue.steal(&target.job_queue)) |stole| {
+            if (thread.action_queue.steal(&target.action_queue)) |stole| {
                 return stole;
             }
         }
@@ -576,17 +711,17 @@ const Event = struct {
 
 // FIFO
 // We add to front and take from the back
-const JobQueue = struct {
-    // Head is atomic since when we add jobs nodes to the queue or consume job nodes, we dont want other
+const ActionQueue = struct {
+    // Head is atomic since when we add jobs nodes to the queue or consume action nodes, we dont want other
     // threads to be grabbing our shit.
     const capacity: u32 = 50;
     head: Atomic(u32) = Atomic(u32).init(0),
     tail: Atomic(u32) = Atomic(u32).init(0),
     buffer: [capacity]Atomic(*Node) = undefined,
-    pub fn enqueue(job_queue: *JobQueue, job_list: *JobList) error{Overflow}!void {
+    pub fn enqueue(action_queue: *ActionQueue, action_list: *ActionList) error{Overflow}!void {
         // We do not need to have this execute in the correct order of writes or reads
-        var head = job_queue.head.load(.monotonic);
-        var tail = job_queue.tail.load(.monotonic); // We are the only one who can change this
+        var head = action_queue.head.load(.monotonic);
+        var tail = action_queue.tail.load(.monotonic); // We are the only one who can change this
 
         while (true) {
             var size = tail -% head;
@@ -594,25 +729,25 @@ const JobQueue = struct {
             // Attempt to fill the buffer;
             if (size < capacity) {
                 // We set the current_node to the list head
-                var current_node: ?*Node = job_list.head;
+                var current_node: ?*Node = action_list.head;
                 while (size < capacity) : (size += 1) {
                     const node_to_add = current_node orelse break;
                     // print("Attempting to add node to buffer\n", .{});
-                    // we set the current_node to the node next in the job_list;
+                    // we set the current_node to the node next in the action_list;
                     current_node = current_node.?.next;
                     // tail = 30 then capacity equals 256 then tail % capacity = 30
-                    job_queue.buffer[tail % capacity].store(node_to_add, .unordered);
+                    action_queue.buffer[tail % capacity].store(node_to_add, .unordered);
                     tail +%= 1;
                 }
                 // release barrier synchronizes with Acquire loads for steal()ers to see the array writes.
-                job_queue.tail.store(tail, .release);
+                action_queue.tail.store(tail, .release);
 
                 // Update the list so that all the nodes which were added are removed from the argument list
-                job_list.head = current_node orelse return;
+                action_list.head = current_node orelse return;
                 std.atomic.spinLoopHint();
                 // try again if there's more. we try again since the head and tail of the buffer can change
-                // the job_queue can also change, since threads can steal from this queue
-                head = job_queue.head.load(.monotonic);
+                // the action_queue can also change, since threads can steal from this queue
+                head = action_queue.head.load(.monotonic);
                 continue;
             }
 
@@ -620,7 +755,7 @@ const JobQueue = struct {
             // so instead we first try to see if any items has been taken from the buffer
             // if we can't take the head again another thread is grabbing it
             // thus we take the current buffer and create a linkedlist of the first half of the buffer
-            // and add the passed in job_list and add it to the end;
+            // and add the passed in action_list and add it to the end;
             // Then we return overflowed since we couldnt grab the head since another thread is taking
             // and we couldnt add items which means it overflowed for now
             // remeber the buffer size stays at 256 always it the nodes inside that change
@@ -634,10 +769,10 @@ const JobQueue = struct {
             // The migration_size ie the size of the current buffer / 2
             var migration_size = size / 2;
             // Here we increment the head node by half essentially we try to steal half the buffer
-            // remember the job_queue head is the buffer index so if we increment it by double
-            // here we try to aquire the head of the job_queue and replace it with double the size so that
+            // remember the action_queue head is the buffer index so if we increment it by double
+            // here we try to aquire the head of the action_queue and replace it with double the size so that
             // we can add more items into the buffer
-            head = job_queue.head.cmpxchgStrong(
+            head = action_queue.head.cmpxchgStrong(
                 head,
                 head +% migration_size,
                 .acquire,
@@ -646,37 +781,37 @@ const JobQueue = struct {
                 // This occures when we succeed to grab the head;
                 // Link the migrated Nodes together
                 // here we grab the first half of the buffer
-                const first: *Node = job_queue.buffer[head % capacity].load(.monotonic);
+                const first: *Node = action_queue.buffer[head % capacity].load(.monotonic);
                 // then while the migration_size is greater than zero
                 while (migration_size > 0) : (migration_size -= 1) {
                     // We grab the current_node from the begining of the buffer and link it to the next one
-                    // We create a linked list from the job_queue.buffer
-                    const prev: *Node = job_queue.buffer[head % capacity].load(.monotonic);
+                    // We create a linked list from the action_queue.buffer
+                    const prev: *Node = action_queue.buffer[head % capacity].load(.monotonic);
                     // print("Prev Grabbing the first node increment head \n", .{});
                     head +%= 1;
-                    prev.next = job_queue.buffer[head % capacity].load(.monotonic);
+                    prev.next = action_queue.buffer[head % capacity].load(.monotonic);
                 }
                 // at this point we have a linked list the starts from the first to the end
 
                 // Append the list that was supposed to be pushed to the end of the migrated Nodes
-                // Here we grab the last node in the job_queue.buffer, remember we are not altering the buffer
+                // Here we grab the last node in the action_queue.buffer, remember we are not altering the buffer
 
-                const last = job_queue.buffer[(head -% 1) % capacity].load(.monotonic);
+                const last = action_queue.buffer[(head -% 1) % capacity].load(.monotonic);
                 // now we take the list that was passed in and add it to the back of the linkedlist we created
-                last.next = job_list.head;
-                job_list.tail.next = null;
+                last.next = action_list.head;
+                action_list.tail.next = null;
 
-                // Return the migrated nodes + the original job_list as overflowed
-                // we then set the job_list to the new linkedlist and return overflow as the buffer is overflowed
-                job_list.head = first;
+                // Return the migrated nodes + the original action_list as overflowed
+                // we then set the action_list to the new linkedlist and return overflow as the buffer is overflowed
+                action_list.head = first;
                 return error.Overflow;
             };
         }
     }
-    pub fn dequeue(job_queue: *JobQueue) ?*Node {
+    pub fn dequeue(action_queue: *ActionQueue) ?*Node {
         // Here we grab the buffer index start and end of the buffer
-        var head = job_queue.head.load(.monotonic);
-        const tail = job_queue.tail.load(.monotonic); // we're the only thread that can change this
+        var head = action_queue.head.load(.monotonic);
+        const tail = action_queue.tail.load(.monotonic); // we're the only thread that can change this
 
         // We then loop and try and grab the head of the buffer and exchange it for head+%1
         // If we can't do this we return the buffer node
@@ -697,30 +832,30 @@ const JobQueue = struct {
             // also we load atomically so then we load from the buffer which can only happen one at a time
             // the question is though can't two threads load the same value, because if two fail
             // then two load the same value
-            // print("Poping the buffer {d} \n", .{job_queue.buffer[head % capacity].load(.monotonic).id});
-            head = job_queue.head.cmpxchgStrong(
+            // print("Poping the buffer {d} \n", .{action_queue.buffer[head % capacity].load(.monotonic).id});
+            head = action_queue.head.cmpxchgStrong(
                 head,
                 head +% 1,
                 .acquire,
                 .monotonic,
-            ) orelse return job_queue.buffer[head % capacity].load(.monotonic);
+            ) orelse return action_queue.buffer[head % capacity].load(.monotonic);
         }
     }
 
-    const Stole = struct {
+    const Thief = struct {
         node: *Node,
         pushed: bool,
     };
 
     // This function consumes nodes from the queue and pushes them to the buffer
     // This is for the thread to use to consume from queues and push to there queue
-    fn consume(job_queue: *JobQueue, contract_queue: *ContractQueue) ?Stole {
+    fn consume(action_queue: *ActionQueue, injector: *Injector) ?Thief {
         // We first attempt to get a consumer
-        var consumer = contract_queue.tryAcquireConsumer() catch return null;
-        defer contract_queue.releaseConsumer(consumer);
+        var consumer = injector.tryAcquireHeister() catch return null;
+        defer injector.releaseHeister(consumer);
 
-        const head = job_queue.head.load(.monotonic);
-        const tail = job_queue.tail.load(.monotonic); // we're the only thread that can change this
+        const head = action_queue.head.load(.monotonic);
+        const tail = action_queue.tail.load(.monotonic); // we're the only thread that can change this
 
         const size = tail -% head;
         assert(size <= capacity);
@@ -730,11 +865,11 @@ const JobQueue = struct {
         // Atomic stores to the array as steal() threads may be atomically reading from it.
         var pushed: u32 = 0;
         while (pushed < capacity) : (pushed += 1) {
-            const node = contract_queue.pop(&consumer) orelse break;
+            const node = injector.pop(&consumer) orelse break;
             // print("Adding the nodes to the buffer {d} \n", .{node.id});
             // in pop we set the consumer to the next node
             // 30 +% 0 = 30 => 30 % capacity = 30;
-            job_queue.buffer[(tail +% pushed) % capacity].store(node, .unordered);
+            action_queue.buffer[(tail +% pushed) % capacity].store(node, .unordered);
         }
 
         // We will be returning one node that we stole from the queue.
@@ -742,29 +877,29 @@ const JobQueue = struct {
         // We attempt to grab another node if its null and we didnt push anything we return null
         // else we load the last node value in the buffer and break
         // this way we either grab the next node in the contract queue or return the last buffer node value
-        // print("Grab the next node in the contract_queue or buffer\n", .{});
-        const node = contract_queue.pop(&consumer) orelse blk: {
+        // print("Grab the next node in the injector or buffer\n", .{});
+        const node = injector.pop(&consumer) orelse blk: {
             if (pushed == 0) return null;
             pushed -= 1;
-            break :blk job_queue.buffer[(tail +% pushed) % capacity].load(.monotonic);
+            break :blk action_queue.buffer[(tail +% pushed) % capacity].load(.monotonic);
         };
         // print("Stolen node {d}\n", .{node.id});
 
         // Update the array tail with the nodes we pushed to it.
         // release barrier to synchronize with Acquire barrier in steal()'s to see the written array Nodes.
         // if we pushed then we store the new tail value since its been updated
-        if (pushed > 0) job_queue.tail.store(tail +% pushed, .release);
+        if (pushed > 0) action_queue.tail.store(tail +% pushed, .release);
         // then we return the stolen node
-        return Stole{
+        return Thief{
             .node = node,
             .pushed = pushed > 0,
         };
     }
 
-    // steal steals from other threads job_queues and sotre them in their job_queue
-    fn steal(noalias job_queue: *JobQueue, noalias work_stealing_queue: *JobQueue) ?Stole {
-        const head = job_queue.head.load(.monotonic);
-        const tail = job_queue.tail.load(.monotonic); // we're the only thread that can change this
+    // steal steals from other threads job_queues and sotre them in theiraction_queue
+    fn steal(noalias action_queue: *ActionQueue, noalias work_stealing_queue: *ActionQueue) ?Thief {
+        const head = action_queue.head.load(.monotonic);
+        const tail = action_queue.tail.load(.monotonic); // we're the only thread that can change this
 
         const size = tail -% head;
         assert(size <= capacity);
@@ -795,8 +930,8 @@ const JobQueue = struct {
             while (i < steal_size) : (i += 1) {
                 // here we grab the stolen_job_queue node
                 const node = work_stealing_queue.buffer[(stealable_buffer_head +% i) % capacity].load(.unordered);
-                // then we store it in the job_queue
-                job_queue.buffer[(tail +% i) % capacity].store(node, .unordered);
+                // then we store it in theaction_queue
+                action_queue.buffer[(tail +% i) % capacity].store(node, .unordered);
             }
 
             // Try to commit the steal from the target buffer using:
@@ -812,12 +947,12 @@ const JobQueue = struct {
                 // Pop one from the nodes we stole as we'll be returning it
 
                 const pushed = steal_size - 1;
-                const node = job_queue.buffer[(tail +% pushed) % capacity].load(.monotonic);
+                const node = action_queue.buffer[(tail +% pushed) % capacity].load(.monotonic);
 
                 // Update the array tail with the nodes we pushed to it.
                 // release barrier to synchronize with Acquire barrier in steal()'s to see the written array Nodes.
-                if (pushed > 0) job_queue.tail.store(tail +% pushed, .release);
-                return Stole{
+                if (pushed > 0) action_queue.tail.store(tail +% pushed, .release);
+                return Thief{
                     .node = node,
                     .pushed = pushed > 0,
                 };
@@ -827,7 +962,7 @@ const JobQueue = struct {
 };
 
 // LIFO Stack
-const ContractQueue = struct {
+const Injector = struct {
     // the stack holds ptrs to the nodes
     stack: Atomic(usize) = Atomic(usize).init(0),
     cache: ?*Node = null,
@@ -846,30 +981,30 @@ const ContractQueue = struct {
         assert(@alignOf(Node) >= ((IS_CONSUMING | HAS_CACHE) + 1));
     }
 
-    fn push(contract_queue: *ContractQueue, job_list: *JobList) void {
-        // print("Pushing to the contract_queue...\n", .{});
-        // Here we take the contract_queue and job_list and try to add it to the stack
+    fn push(injector: *Injector, action_list: *ActionList) void {
+        // print("Pushing to the injector...\n", .{});
+        // Here we take the injector and action_list and try to add it to the stack
         // we atomically load the stack from mem
-        var stack = contract_queue.stack.load(.monotonic);
+        var stack = injector.stack.load(.monotonic);
         // print("Loading the stack {d} \n", .{stack});
-        // print("----------Job_list{any}\n", .{job_list});
+        // print("----------Job_list{any}\n", .{action_list});
         while (true) {
-            // we add the stack to the end of the job_list
+            // we add the stack to the end of theaction_list
             // var pointer_value = stack & PTR_MASK, masks out the last to bits ;
             // here we take the stack 0b10111.... and the PTR_MASK 0b1111111...00
             // thus the last two bits are masked out sicne the PTR_MASK is always 00
-            job_list.tail.next = @ptrFromInt(stack & PTR_MASK);
+            action_list.tail.next = @ptrFromInt(stack & PTR_MASK);
             // print("Adding stack to the tail\n", .{});
 
             // Update the stack with the list (pt. 2).
             // Don't change the HAS_CACHE and IS_CONSUMING bits of the consumer.
-            // Here we create a new stack with the job_list.head as the start
+            // Here we create a new stack with the action_list.head as the start
             // basically just converts the value to a usize its just the node of the node
 
-            var new_stack = @intFromPtr(job_list.head);
+            var new_stack = @intFromPtr(action_list.head);
             // print("creating new stack\n", .{});
             // we assert that the new_stack masked with the inverse == 0
-            // PTR_MASK = 0b0000000..11 and so the result is 0b0000000000 because the job_list head should have 00 at the last two bits
+            // PTR_MASK = 0b0000000..11 and so the result is 0b0000000000 because the action_list head should have 00 at the last two bits
             assert(new_stack & ~PTR_MASK == 0);
             // then we take the current stack & ~PTR_MASK which as seen above extracts the bit flags
             // we then set the bit flags to the new_stack this way when we compare and exchange another thread
@@ -881,7 +1016,7 @@ const ContractQueue = struct {
 
             // Push to the stack with a release barrier for the consumer to see the proper list links.
             // So if we succeed with the stack excahnge we then break
-            stack = contract_queue.stack.cmpxchgStrong(
+            stack = injector.stack.cmpxchgStrong(
                 stack,
                 new_stack,
                 .release,
@@ -895,8 +1030,8 @@ const ContractQueue = struct {
     // then we check if the bit flag is_consuming is set to 1 if so we return
     // same thign for the cache andnode
     // if the bit flag for the cache is 0 no cache node then we
-    fn tryAcquireConsumer(contract_queue: *ContractQueue) error{ Empty, Contended }!?*Node {
-        var stack = contract_queue.stack.load(.monotonic);
+    fn tryAcquireHeister(injector: *Injector) error{ Empty, Contended }!?*Node {
+        var stack = injector.stack.load(.monotonic);
         while (true) {
             // Here we check the bit_flag is consuming is set to 0 else it has a consumer
             // Here we comapre is consuming with is 0b10 with the stack the & check both ....10 are the same
@@ -930,17 +1065,17 @@ const ContractQueue = struct {
 
             // Acquire barrier on getting the consumer to see cache/Node updates done by previous consumers
             // and to ensure our cache/Node updates in pop() happen after that of previous consumers.
-            stack = contract_queue.stack.cmpxchgStrong(
+            stack = injector.stack.cmpxchgStrong(
                 stack,
                 new_stack,
                 .acquire,
                 .monotonic,
                 // If we succeed with the cas then we return the stack or cached value
-            ) orelse return contract_queue.cache orelse @ptrFromInt(stack & PTR_MASK);
+            ) orelse return injector.cache orelse @ptrFromInt(stack & PTR_MASK);
         }
     }
 
-    fn releaseConsumer(noalias contract_queue: *ContractQueue, noalias consumer: ?*Node) void {
+    fn releaseHeister(noalias injector: *Injector, noalias consumer: ?*Node) void {
         // Stop consuming and remove the HAS_CACHE bit as well if the consumer's cache is empty.
         // When HAS_CACHE bit is zeroed, the next consumer will acquire the pushed stack nodes.
         var remove = IS_CONSUMING;
@@ -951,15 +1086,15 @@ const ContractQueue = struct {
         // release the consumer with a release barrier to ensure cache/node accesses
         // happen before the consumer was released and before the next consumer starts using the cache.
         // if we have popped then the consumer is now the next node so now the cache holds the next node
-        contract_queue.cache = consumer;
+        injector.cache = consumer;
         // we remove the is_cosnuming and the has_cache if consumer is null
         // we remove the current is_consumong and cache vlaue if the next node value null;
-        const stack = contract_queue.stack.fetchSub(remove, .release);
+        const stack = injector.stack.fetchSub(remove, .release);
         // we assert then the old stack & remove is != 0 since the old_stack had is consuming flag then this will be true
         assert(stack & remove != 0);
     }
 
-    fn pop(noalias contract_queue: *ContractQueue, noalias consumer_ref: *?*Node) ?*Node {
+    fn pop(noalias injector: *Injector, noalias consumer_ref: *?*Node) ?*Node {
         // Check the consumer cache (fast path)
         if (consumer_ref.*) |node| {
             consumer_ref.* = node.next;
@@ -967,7 +1102,7 @@ const ContractQueue = struct {
         }
 
         // Load the stack to see if there was anything pushed that we could grab.
-        var stack = contract_queue.stack.load(.monotonic);
+        var stack = injector.stack.load(.monotonic);
         assert(stack & IS_CONSUMING != 0);
         if (stack & PTR_MASK == 0) {
             return null;
@@ -976,7 +1111,7 @@ const ContractQueue = struct {
         // Nodes have been pushed to the stack, grab then with an Acquire barrier to see the Node links.
         // this swaps out the current stack node and replaces it with 000000..11;
         // this shows the other threads we are consuming
-        stack = contract_queue.stack.swap(HAS_CACHE | IS_CONSUMING, .acquire);
+        stack = injector.stack.swap(HAS_CACHE | IS_CONSUMING, .acquire);
         assert(stack & IS_CONSUMING != 0);
         assert(stack & PTR_MASK != 0);
 
